@@ -11,8 +11,8 @@ COPY index.php /app/index.php
 ENV TZ=Asia/Shanghai
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# 暴露 8081 端口
-EXPOSE 8081
+# 暴露 8080 端口
+EXPOSE 8080
 
 # 启动 PHP 内置服务器。
-CMD ["php", "-S", "0.0.0.0:8081", "/app/index.php"]
+CMD ["php", "-S", "0.0.0.0:8080", "/app/index.php"]
