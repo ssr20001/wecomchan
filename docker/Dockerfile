@@ -7,9 +7,11 @@ WORKDIR /app
 # 将核心脚本复制进去
 COPY index.php /app/index.php
 
-# 设置时区
+# 安装 tzdata 并设置时区
 ENV TZ=Asia/Shanghai
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+RUN apk add --no-cache tzdata \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone
 
 # 暴露 8080 端口
 EXPOSE 8080
