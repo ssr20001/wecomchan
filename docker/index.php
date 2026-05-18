@@ -1,4 +1,7 @@
 <?php
+// 0. 设置时区 GMT+8
+date_default_timezone_set('Asia/Shanghai');
+
 // 1. 动态读取运行时的环境变量
 $CORPID = getenv('CORPID') ?: '';
 $CORPSECRET = getenv('CORPSECRET') ?: '';
@@ -7,6 +10,19 @@ $SENDKEY = getenv('SENDKEY') ?: '';
 
 // 2. 全能数据解析器：合并 GET参数、POST表单 和 JSON Body
 $raw_input = file_get_contents('php://input');
+
+// 记录详细请求日志输出到 Docker 日志流
+$log_msg = sprintf(
+    "[%s] %s %s | GET: %s | POST: %s | BODY: %s\n",
+    date('Y-m-d H:i:s'),
+    $_SERVER['REQUEST_METHOD'] ?? 'UNKNOWN',
+    $_SERVER['REQUEST_URI'] ?? '/',
+    json_encode($_GET, JSON_UNESCAPED_UNICODE),
+    json_encode($_POST, JSON_UNESCAPED_UNICODE),
+    $raw_input
+);
+file_put_contents('php://stderr', $log_msg);
+
 $json_data = json_decode($raw_input, true);
 if (!is_array($json_data)) $json_data = [];
 
@@ -26,7 +42,7 @@ $content = $data['msg'] ?? $data['desp'] ?? $data['content'] ?? '';
 
 $full_message = "";
 
-// 如果有标题，且标题和内容不一样，就加上标题和两个换行（不加任何括号）
+// 如果有标题，且标题和内容不一样，就加上标题和两个换行
 if (!empty($title) && $title !== $content) {
     $full_message .= $title . "\n\n";
 }
