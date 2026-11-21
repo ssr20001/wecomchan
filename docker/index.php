@@ -93,18 +93,17 @@ if ($fix_on) {
     }
 }
 
-// 输出请求日志到 stderr
-$log_msg = sprintf(
-    "[%s] %s %s | FIXED: %s | GET: %s | POST: %s | BODY: %s\n",
-    date('Y-m-d H:i:s'),
-    $_SERVER['REQUEST_METHOD'] ?? 'UNKNOWN',
-    $_SERVER['REQUEST_URI'] ?? '/',
-    $repaired ? implode('+', $repaired) : 'none',
-    json_encode($get_data, JSON_UNESCAPED_UNICODE),
-    json_encode($form_data, JSON_UNESCAPED_UNICODE),
-    $raw_input
-);
-file_put_contents('php://stderr', $log_msg);
+/**
+ * 仅记录固定事件及非敏感元信息，不记录 URL、参数名/值、正文或上游响应。
+ */
+function log_event($event, array $metadata = [])
+{
+    $entry = array_merge([
+        'time' => date('c'),
+        'event' => $event,
+    ], $metadata);
+    file_put_contents('php://stderr', json_encode($entry, JSON_UNESCAPED_UNICODE) . "\n");
+}
 
 // 3. 解析 JSON Body
 $json_data = json_decode($raw_input, true);
@@ -115,7 +114,19 @@ $data = array_merge($get_data, $form_data, $json_data);
 
 // 5. 身份验证
 $req_key = $data['sendkey'] ?? '';
-if (empty($SENDKEY) || $req_key !== $SENDKEY) {
+$authenticated = !empty($SENDKEY) && $req_key === $SENDKEY;
+$method = $_SERVER['REQUEST_METHOD'] ?? '';
+log_event('request', [
+    'method' => in_array($method, ['GET', 'POST', 'HEAD', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], true) ? $method : 'OTHER',
+    'auth' => $authenticated ? 'accepted' : 'rejected',
+    'fixed' => $repaired,
+    'query_bytes' => strlen($raw_query),
+    'body_bytes' => strlen($raw_input),
+    'get_params' => count($get_data),
+    'form_params' => count($form_data),
+    'json_params' => count($json_data),
+]);
+if (!$authenticated) {
     http_response_code(403);
     die(json_encode(["errcode" => 403, "errmsg" => "Sendkey Error!"]));
 }
@@ -128,8 +139,11 @@ $full_message = (!empty($title) && $title !== $content) ? ($title . "\n\n" . $co
 
 // 7. 获取 Access Token
 $token_url = "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={$CORPID}&corpsecret={$CORPSECRET}";
-$token_resp = json_decode(file_get_contents($token_url), true);
+// 网络警告可能包含带凭据的完整 URL，改用固定错误事件。
+$token_raw = @file_get_contents($token_url);
+$token_resp = $token_raw === false ? null : json_decode($token_raw, true);
 if (!isset($token_resp['access_token'])) {
+    log_event('token_fetch_failed');
     die(json_encode(["errcode" => 500, "errmsg" => "Failed to get access token"]));
 }
 
@@ -150,4 +164,8 @@ $opts = [
         "content" => json_encode($msg_payload, JSON_UNESCAPED_UNICODE)
     ]
 ];
-echo file_get_contents("https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={$token_resp['access_token']}", false, stream_context_create($opts));
+$send_response = @file_get_contents("https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={$token_resp['access_token']}", false, stream_context_create($opts));
+if ($send_response === false) {
+    log_event('message_send_failed');
+}
+echo $send_response;
