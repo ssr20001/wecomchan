@@ -1,5 +1,5 @@
-# 使用 alpine 镜像
-FROM php:8.2-cli-alpine
+# 官方 PHP 8.5 Alpine 镜像
+FROM php:8.5-cli-alpine
 
 # 设置工作目录
 WORKDIR /app
@@ -16,5 +16,5 @@ RUN apk add --no-cache tzdata \
 # 暴露 8080 端口
 EXPOSE 8080
 
-# 启动 PHP 内置服务器。
-CMD ["php", "-S", "0.0.0.0:8080", "/app/index.php"]
+# 关闭原始日志，避免泄露请求 URL。
+CMD ["sh", "-c", "exec php -d display_errors=0 -d log_errors=0 -S 0.0.0.0:8080 /app/index.php 2>/dev/null"]

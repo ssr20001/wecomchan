@@ -2,6 +2,33 @@
 // 0. 设置时区
 date_default_timezone_set('Asia/Shanghai');
 
+// 关闭原始错误输出，避免泄露密钥。
+ini_set('display_errors', '0');
+ini_set('log_errors', '0');
+$request_id = bin2hex(random_bytes(16));
+$request_started = microtime(true);
+$request_outcome = 'internal_error';
+$request_log = [];
+$log_level = strtolower(trim(getenv('LOG_LEVEL') ?: 'info'));
+header('Content-Type: application/json; charset=utf-8');
+header('X-Request-ID: ' . $request_id);
+
+register_shutdown_function(static function () {
+    global $request_started, $request_outcome, $request_log;
+    $error = error_get_last();
+    if ($error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+        $request_outcome = 'internal_error';
+        http_response_code(500);
+        $request_log = ['reason' => 'fatal_error', 'line' => $error['line']];
+        echo json_encode(['errcode' => 500, 'errmsg' => 'Internal server error']);
+    }
+    log_event('request_completed', array_merge($request_log, [
+        'http_status' => http_response_code() ?: 200,
+        'outcome' => $request_outcome,
+        'duration_ms' => round((microtime(true) - $request_started) * 1000, 2),
+    ]), $request_outcome === 'success' ? 'info' : ($request_outcome === 'auth_rejected' || $request_outcome === 'invalid_request' ? 'warning' : 'error'));
+});
+
 // 1. 读取环境变量
 $CORPID = getenv('CORPID') ?: '';
 $CORPSECRET = getenv('CORPSECRET') ?: '';
@@ -93,16 +120,77 @@ if ($fix_on) {
     }
 }
 
-/**
- * 仅记录固定事件及非敏感元信息，不记录 URL、参数名/值、正文或上游响应。
- */
-function log_event($event, array $metadata = [])
+// 每次请求默认只记录最终结果；过程信息仅在 debug 下输出，不记录密钥、正文或 URL。
+function log_event($event, array $metadata = [], $level = 'info')
 {
-    $entry = array_merge([
-        'time' => date('c'),
-        'event' => $event,
-    ], $metadata);
-    file_put_contents('php://stderr', json_encode($entry, JSON_UNESCAPED_UNICODE) . "\n");
+    global $request_id, $log_level;
+    $levels = ['debug' => 10, 'info' => 20, 'warning' => 30, 'error' => 40];
+    if (!isset($levels[$level]) || $levels[$level] < ($levels[$log_level] ?? 20)) return;
+    $outcomes = ['success' => '推送成功', 'auth_rejected' => '鉴权失败（SENDKEY 不匹配或未配置）',
+        'invalid_request' => '请求无效', 'upstream_error' => '推送失败', 'internal_error' => '内部错误'];
+    $reasons = ['fatal_error' => 'PHP 致命错误', 'invalid_field' => '消息字段必须是字符串',
+        'invalid_utf8' => '消息不是有效的 UTF-8', 'transport_error' => '网络连接失败或超时',
+        'http_error' => '上游 HTTP 异常', 'invalid_response' => '上游响应格式异常',
+        'invalid_credential' => '凭证无效', 'invalid_corpid' => 'CORPID 无效',
+        'invalid_access_token' => 'Access Token 无效', 'expired_access_token' => 'Access Token 已过期',
+        'ip_not_allowed' => '出口 IP 不在企业微信白名单', 'upstream_rejected' => '企业微信拒绝请求',
+        'missing_token' => '上游未返回 Access Token'];
+    $stages = ['token' => '获取 Token', 'send' => '发送消息'];
+    $labels = ['stage' => '阶段', 'upstream_http_status' => '上游HTTP', 'upstream_errcode' => '错误码',
+        'reason' => '原因', 'line' => '代码行', 'http_status' => 'HTTP',
+        'method' => '方法', 'fixed' => '参数修复', 'duration_ms' => '耗时'];
+    $message = $event === 'request_completed' ? ($outcomes[$metadata['outcome']] ?? '未知结果')
+        : ($event === 'request' ? '收到请求' : '上游调用');
+    $parts = [];
+    foreach ($labels as $key => $label) {
+        if (!isset($metadata[$key]) || $metadata[$key] === []) continue;
+        if ($key === 'http_status' && ($metadata['outcome'] ?? '') === 'success') continue;
+        $value = $metadata[$key];
+        if ($key === 'stage') $value = $stages[$value] ?? $value;
+        elseif ($key === 'reason') $value = $reasons[$value] ?? $value;
+        elseif ($key === 'fixed') $value = implode(',', $value);
+        elseif ($key === 'duration_ms') $value .= 'ms';
+        $parts[] = $label . '=' . $value;
+    }
+    file_put_contents('php://stdout', date('Y-m-d H:i:s') . ' [' . strtoupper($level) . '] [' . $request_id . '] '
+        . $message . ($parts ? ' | ' . implode(' | ', $parts) : '') . "\n");
+}
+
+// 记录上游状态与耗时，不记录 URL 或原始响应。
+function request_upstream($stage, $url, array $opts = [])
+{
+    global $request_log;
+    $opts['http']['timeout'] = 10;
+    $opts['http']['ignore_errors'] = true;
+    $opts['http']['follow_location'] = 0;
+    $started = microtime(true);
+    http_clear_last_response_headers();
+    $raw = @file_get_contents($url, false, stream_context_create($opts));
+    $status = 0;
+    foreach (http_get_last_response_headers() ?? [] as $header) {
+        if (preg_match('/^HTTP\/\S+\s+(\d{3})\b/', $header, $matches)) $status = (int) $matches[1];
+    }
+    $data = is_string($raw) ? json_decode($raw, true) : null;
+    $code = is_array($data) && isset($data['errcode']) && is_int($data['errcode'])
+        && $data['errcode'] >= -1 && $data['errcode'] <= 999999 ? $data['errcode'] : null;
+    $meta = ['stage' => $stage, 'upstream_http_status' => $status,
+        'duration_ms' => round((microtime(true) - $started) * 1000, 2)];
+    if ($code !== null) $meta['upstream_errcode'] = $code;
+    $reason = null;
+    if ($raw === false) $reason = 'transport_error';
+    elseif ($status < 200 || $status >= 300) $reason = 'http_error';
+    elseif ($code === null) $reason = 'invalid_response';
+    elseif ($code !== 0) $reason = [40001 => 'invalid_credential', 40013 => 'invalid_corpid',
+        40014 => 'invalid_access_token', 42001 => 'expired_access_token',
+        40164 => 'ip_not_allowed', 60020 => 'ip_not_allowed'][$code] ?? 'upstream_rejected';
+    elseif ($stage === 'token' && (!isset($data['access_token']) || !is_string($data['access_token']) || $data['access_token'] === '')) $reason = 'missing_token';
+    if ($reason !== null) {
+        $meta['reason'] = $reason;
+        $request_log = $meta;
+    }
+    log_event('upstream_result', $meta, 'debug');
+    return ['raw' => $raw, 'data' => $data, 'ok' => $reason === null,
+        'valid_response' => $raw !== false && $status >= 200 && $status < 300 && $code !== null];
 }
 
 // 3. 解析 JSON Body
@@ -114,19 +202,14 @@ $data = array_merge($get_data, $form_data, $json_data);
 
 // 5. 身份验证
 $req_key = $data['sendkey'] ?? '';
-$authenticated = !empty($SENDKEY) && $req_key === $SENDKEY;
+$authenticated = $SENDKEY !== '' && is_string($req_key) && hash_equals($SENDKEY, $req_key);
 $method = $_SERVER['REQUEST_METHOD'] ?? '';
 log_event('request', [
     'method' => in_array($method, ['GET', 'POST', 'HEAD', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], true) ? $method : 'OTHER',
-    'auth' => $authenticated ? 'accepted' : 'rejected',
     'fixed' => $repaired,
-    'query_bytes' => strlen($raw_query),
-    'body_bytes' => strlen($raw_input),
-    'get_params' => count($get_data),
-    'form_params' => count($form_data),
-    'json_params' => count($json_data),
-]);
+], 'debug');
 if (!$authenticated) {
+    $request_outcome = 'auth_rejected';
     http_response_code(403);
     die(json_encode(["errcode" => 403, "errmsg" => "Sendkey Error!"]));
 }
@@ -135,16 +218,23 @@ if (!$authenticated) {
 $title = $data['text'] ?? $data['title'] ?? '';
 $content = $data['msg'] ?? $data['desp'] ?? $data['content'] ?? '';
 
+if (!is_string($title) || !is_string($content)) {
+    $request_outcome = 'invalid_request';
+    $request_log = ['reason' => 'invalid_field'];
+    http_response_code(400);
+    die(json_encode(['errcode' => 400, 'errmsg' => 'Message fields must be strings']));
+}
+
 $full_message = (!empty($title) && $title !== $content) ? ($title . "\n\n" . $content) : $content;
 
 // 7. 获取 Access Token
-$token_url = "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={$CORPID}&corpsecret={$CORPSECRET}";
-// 网络警告可能包含带凭据的完整 URL，改用固定错误事件。
-$token_raw = @file_get_contents($token_url);
-$token_resp = $token_raw === false ? null : json_decode($token_raw, true);
-if (!isset($token_resp['access_token'])) {
-    log_event('token_fetch_failed');
-    die(json_encode(["errcode" => 500, "errmsg" => "Failed to get access token"]));
+$request_outcome = 'upstream_error';
+$token_url = 'https://qyapi.weixin.qq.com/cgi-bin/gettoken?' . http_build_query(
+    ['corpid' => $CORPID, 'corpsecret' => $CORPSECRET], '', '&', PHP_QUERY_RFC3986);
+$token = request_upstream('token', $token_url);
+if (!$token['ok']) {
+    http_response_code(502);
+    die(json_encode(['errcode' => 500, 'errmsg' => 'Failed to get access token']));
 }
 
 // 8. 推送至企业微信
@@ -164,8 +254,16 @@ $opts = [
         "content" => json_encode($msg_payload, JSON_UNESCAPED_UNICODE)
     ]
 ];
-$send_response = @file_get_contents("https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={$token_resp['access_token']}", false, stream_context_create($opts));
-if ($send_response === false) {
-    log_event('message_send_failed');
+if ($opts['http']['content'] === false) {
+    $request_outcome = 'invalid_request';
+    $request_log = ['reason' => 'invalid_utf8'];
+    http_response_code(400);
+    die(json_encode(['errcode' => 400, 'errmsg' => 'Message must be valid UTF-8']));
 }
-echo $send_response;
+$sent = request_upstream('send', 'https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=' . rawurlencode($token['data']['access_token']), $opts);
+if (!$sent['valid_response']) {
+    http_response_code(502);
+    die(json_encode(['errcode' => 502, 'errmsg' => 'Failed to send message']));
+}
+$request_outcome = $sent['ok'] ? 'success' : 'upstream_error';
+echo $sent['raw'];
